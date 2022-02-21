@@ -57,7 +57,8 @@ set(DirsToLookInForIncludes ${DirsToLookInForIncludes}
                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
 # Include logger
-target_sources(STDC-Seg_TensorRT PRIVATE "logger.cpp")
+target_sources(STDC-Seg_TensorRT PRIVATE "logger.cpp"
+                                         "Segmenter.cpp")
 
 target_link_libraries(STDC-Seg_TensorRT ${LibrariesToLink})
 
