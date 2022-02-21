@@ -30,11 +30,15 @@ set(DirsToLookInForIncludes "")
 find_library(CV_VIDEOIO libopencv_videoio.so HINTS "${PATH_TO_OPENCV_LIBS}")
 find_library(CV_IMGCODECS libopencv_imgcodecs.so HINTS "${PATH_TO_OPENCV_LIBS}")
 find_library(CV_HIGHGUI libopencv_highgui.so HINTS "${PATH_TO_OPENCV_LIBS}")
+find_library(CV_CORE libopencv_core.so HINTS "${PATH_TO_OPENCV_LIBS}")
+find_library(CV_IMGPROC libopencv_imgproc.so HINTS "${PATH_TO_OPENCV_LIBS}")
 
 set(LibrariesToLink ${LibrariesToLink}
                     ${CV_VIDEOIO}
                     ${CV_IMGCODECS}
-                    ${CV_HIGHGUI})
+                    ${CV_HIGHGUI}
+                    ${CV_CORE}
+                    ${CV_IMGPROC})
 
 set(DirsToLookInForIncludes ${DirsToLookInForIncludes}
                             ${PATH_TO_OPENCV_INCLUDES})

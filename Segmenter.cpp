@@ -1,5 +1,8 @@
 #include "Segmenter.hpp"
 
+                #include <typeinfo>
+        #include <cxxabi.h>
+
 Segmenter::Segmenter(std::string& PathToEngineFile)
 {
     mPathToEngineFile = PathToEngineFile;
@@ -148,79 +151,161 @@ bool Segmenter::AllocateMemory()
 
     return true;
 }
-/*
 
-bool TensorRTDetector::WarmUpModel()
-{
-    // Populate input buffer with all zeros
-    for (int FlatPixelIdx = 0; FlatPixelIdx < 3*mNumInputPixelsWithPadding; FlatPixelIdx++) 
-    {
-        // HAS TO BE BLACK!!!!!!
-        mInputBuffer[FlatPixelIdx] = 0.0;
-        // mInputBuffer[FlatPixelIdx] = 127.0;
-    }
-    
-    // Copy image data to input memory
-    if (cudaMemcpyAsync(mMemoryBindings[0], mInputBuffer, mMemorySizes[0], cudaMemcpyHostToDevice, mStream) != cudaSuccess)
-    {
-        nvinferlogs::gLogError << "ERROR: CUDA memory copy of input failed, size = " << mMemorySizes[0] << " bytes" << std::endl;
-        return false;
-    }
-    
-    // Status messages
-    if(!mSilentMode)
-    {
-        nvinferlogs::gLogInfo << "Performing warmup...\n";
-        nvinferlogs::gLogInfo.flush();
-    }
-      
-    // Three rounds inference
-    for(int WarmUpIdx = 0; WarmUpIdx < 3; WarmUpIdx++)
-    {   
-        // Asynchronously execute inference. enqueueV2(array of pts to input and output nn buffers, cuda stream, N/A)
-        bool InferenceStatus = mExecutionContext->enqueueV2(mMemoryBindings, mStream, nullptr);
-        if (!InferenceStatus)
-        {
-            nvinferlogs::gLogError << "ERROR: TensorRT inference failed" << std::endl;
-            return false;
-        } 
-        
-        cudaStreamSynchronize(mStream);
-    }
-    
-    // Status messages
-    if(!mSilentMode)
-    {
-        nvinferlogs::gLogInfo << "Successfully completed warmup.\n\n";
-        nvinferlogs::gLogInfo.flush();
-    }
-    
-    return true;
-    
-} 
-
-bool TensorRTDetector::LoadAndPrepareModel()
+bool Segmenter::LoadAndPrepareModel()
 {
     // Load 
-    bool LoadSuccessful = true;
-    if(mInitializedWithEnginePtr)
-    {
-        nvinferlogs::gLogInfo << "Preparing yolov5 class instance initialized with engine pointer...\n";
-        nvinferlogs::gLogInfo.flush();
-    }
-    else
-    {
-        LoadSuccessful = LoadModel();
-    }
+    bool LoadSuccessful = LoadModel();
 
     // Allocate
     bool AllocateSuccessful = AllocateMemory();
 
-    // NumClasses is determined in allocate memory, which this method relies on
-    RegisterClassesToDetect();
-    
-    // Warm up
-    bool WarmupSuccessful = WarmUpModel();
+    return (LoadSuccessful && AllocateSuccessful);
+}
 
-    return (LoadSuccessful && AllocateSuccessful && WarmupSuccessful);
-}*/
+void Segmenter::FormatInput(cv::Mat& OriginalImage)
+{
+
+    // Start off with regular image
+    mFormattedImage = OriginalImage.clone();
+    mOriginalImageHeight = mFormattedImage.rows;
+    mOriginalImageWidth = mFormattedImage.cols;
+
+    // Normalize (and make sure mat is 32FC3)
+    mFormattedImage.convertTo(mFormattedImage, CV_32FC3, 1.0/255.0);
+
+    // Standardize, remembering that cv mat's are BGR
+    mFormattedImage = (mFormattedImage - cv::Scalar(mCityscapesMeans[2], mCityscapesMeans[1], mCityscapesMeans[0])) / cv::Scalar(mCityscapesStds[2], mCityscapesStds[1], mCityscapesStds[0]);
+    if(mFormattedImage.rows != mRequiredImageHeight || mFormattedImage.cols != mRequiredImageWidth)
+    {
+        cv::resize(mFormattedImage, mFormattedImage, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
+    }
+
+    // OpenCV Mat is organized like: [B_00, G_00, R_00, B_01, G_01, R_01, ...]
+    // Read image pixels into float array in [R_00, R_01, ..., G_00, G_01, ..., B_00, B_01, ...] format, while normalizing
+    // https://stackoverflow.com/questions/37040787/opencv-in-memory-mat-representation
+    unsigned char* BluePixelPtr = mFormattedImage.data;
+    for (int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageWidth*mRequiredImageHeight; FlatPixelIdx++, BluePixelPtr+=3) 
+    {
+        mInputCpuBuffer[FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[2];
+
+        mInputCpuBuffer[mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[1];
+
+        mInputCpuBuffer[2*mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[0];      
+    }
+}
+
+bool Segmenter::RunInference()
+{
+    // Copy image data to GPU input memory
+    if (cudaMemcpyAsync(mGpuMemoryBindings[0], mInputCpuBuffer, mIoTensorMemorySizesInBytes[0], cudaMemcpyHostToDevice, mStream) != cudaSuccess)
+    {
+        nvinferlogs::gLogError << "ERROR: Failed to copy input tensor to GPU, size = " << mIoTensorMemorySizesInBytes[0] << " bytes" << std::endl;
+        return false;
+    }
+
+    // Asynchronously execute inference. enqueueV2(array of pts to input and output nn buffers, cuda stream, N/A)
+    bool InferenceStatus = mExecutionContext->enqueueV2(mGpuMemoryBindings, mStream, nullptr);
+    if (!InferenceStatus)
+    {
+        nvinferlogs::gLogError << "ERROR: TensorRT inference failed" << std::endl;
+        return false;
+    }
+    
+    // Copy predictions async from output binding memory
+    if (cudaMemcpyAsync(mOutputCpuBuffer, mGpuMemoryBindings[1], mIoTensorMemorySizesInBytes[1], cudaMemcpyDeviceToHost, mStream) != cudaSuccess)
+    {
+        nvinferlogs::gLogError << "ERROR: Failed to copy output tensor to CPU, size = " << mIoTensorMemorySizesInBytes[0] << " bytes" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+void Segmenter::PerformPostProcessing(std::vector<cv::Mat>& Masks)
+{
+    // There is something wrong with using this container. When you set the value of one member Mat at (i, j), (i, j) is set to that value 
+    // for every member Mat. Have to be very careful w/ OpenCV's smart pointer style Mat
+    //
+    // std::vector<cv::Mat> Masks(mNumClasses, cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0)));
+
+    Masks.clear();
+    cv::Mat ZeroMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0));
+
+    float MaxElement;
+    int ClassIdxOfMaxElement;
+    for(int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageHeight*mRequiredImageWidth; FlatPixelIdx++)
+    {
+        // Find which of the mNumClasses classes pixel referred to by FlatPixelIdx belongs to. 
+        // This is just taking the argmax of each pixel across the mNumClasses masks. 
+        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
+        {
+            // Set matrices for the first time
+            if(FlatPixelIdx == 0)
+            {
+                Masks.push_back(ZeroMat.clone());
+            }
+
+            // Handle first iter
+            if(ClassIdx == 0)
+            {
+                MaxElement = mOutputCpuBuffer[FlatPixelIdx];
+                ClassIdxOfMaxElement = ClassIdx;
+            }
+            else
+            {
+                // New max
+                if(mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth] > MaxElement)
+                {
+                    MaxElement = mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth];
+                    ClassIdxOfMaxElement = ClassIdx;
+                }
+            }
+        }
+
+        // Translation from flat pixel idx to non flat pixel idx
+        Masks.at(ClassIdxOfMaxElement).at<unsigned char>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth) = 1;
+    }
+}
+
+bool Segmenter::ProcessFrame(cv::Mat& OriginalImage, std::vector<cv::Mat>& Masks)
+{
+    FormatInput(OriginalImage);
+
+    bool InferenceSuccessful = RunInference();
+
+    if(InferenceSuccessful)
+    {
+        PerformPostProcessing(Masks);
+    }
+
+    return InferenceSuccessful;
+}
+
+cv::Mat Segmenter::DrawMasks(std::vector<cv::Mat>& Masks)
+{
+    cv::Mat MaskFilteredFormattedImage;
+    for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
+    {
+        // Ignore classes with no assigned pixels
+        if(cv::countNonZero(Masks[ClassIdx]) != 0)
+        {
+            // Sets MaskFilteredFormattedImage(x,y) = mFormattedImage(x,y) & mFormattedImage(x,y) = mFormattedImage(x,y), if Masks[ClassIdx](x,y) = 1
+            cv::bitwise_and(mFormattedImage, mFormattedImage, MaskFilteredFormattedImage, Masks[ClassIdx]);
+
+            // Colorize
+            MaskFilteredFormattedImage = .6*mCityscapesColors[ClassIdx] + .3*MaskFilteredFormattedImage;
+
+            // Put back on image
+            MaskFilteredFormattedImage.copyTo(mFormattedImage, Masks[ClassIdx]);
+        }
+    }
+
+    if(mOriginalImageWidth != mRequiredImageWidth || mOriginalImageHeight != mRequiredImageHeight)
+    {
+        cv::resize(mFormattedImage, mFormattedImage, cv::Size(mOriginalImageWidth, mOriginalImageHeight));
+    }
+
+    return mFormattedImage;
+
+}
